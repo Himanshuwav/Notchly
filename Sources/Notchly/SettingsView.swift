@@ -54,15 +54,19 @@ struct GeneralTab: View {
 
     var body: some View {
         Form {
-            Picker("Notch side", selection: $settings.side) {
-                Text("Right").tag(NotchPanel.Side.right)
-                Text("Left").tag(NotchPanel.Side.left)
+            Picker("Notch position", selection: $settings.side) {
+                Text("Right edge").tag(NotchPanel.Side.right)
+                Text("Left edge").tag(NotchPanel.Side.left)
+                Text("Top center").tag(NotchPanel.Side.top)
             }
             .pickerStyle(.segmented)
+            .onChange(of: settings.side) { _, newSide in
+                AppDelegate.shared?.applySide(newSide)
+            }
 
             Toggle("Open Notchly at login", isOn: $settings.launchAtLogin)
 
-            Text("Hover the notch to expand usage cards. Right-click it for refresh and settings.")
+            Text("A grip pokes out of the edge — hover it and the notch opens with usage cards. Right-click for refresh and settings.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

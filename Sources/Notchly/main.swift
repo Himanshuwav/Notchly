@@ -15,10 +15,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppDelegate.shared = self
         store = UsageStore()
 
-        panel = NotchPanel(store: store)
-        panel.setSide(AppSettings.shared.side)
+        panel = NotchPanel(store: store, side: AppSettings.shared.side)
         panel.orderFrontRegardless()
         store.start()
+
+        // Hidden debug hook: --expand opens the notch on launch.
+        if CommandLine.arguments.contains("--expand") {
+            panel.setExpanded(true)
+        }
 
         setupStatusItem()
 
@@ -56,6 +60,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func refreshClicked() { store.refreshAll() }
     @objc private func settingsClicked() { openSettings() }
     @objc private func quitClicked() { NSApp.terminate(nil) }
+
+    @MainActor
+    func applySide(_ side: NotchPanel.Side) {
+        panel.setSide(side)
+    }
 
     @MainActor
     func openSettings() {

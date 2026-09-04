@@ -27,7 +27,7 @@ Notchly never asks for your password. It reads tokens from tools already signed 
 xattr -cr /Applications/Notchly.app
 ```
 
-4. A notch appears on the top-right edge. Hover it. That's the whole UI.
+4. A grip pokes out of the screen edge — right, left, or top-center (pick in Settings). Hover it and the notch opens. That's the whole UI.
 
 ## Build from source
 
