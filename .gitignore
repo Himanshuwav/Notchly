@@ -1,0 +1,5 @@
+.build/
+Notchly.app/
+AppIcon.iconset/
+*.dmg
+.DS_Store
