@@ -132,15 +132,20 @@ final class NotchPanelController {
     }
 
     /// Hidden debug hook: --expand opens the notch on launch. On very first
-    /// run the notch also opens once so the rail is discoverable.
+    /// run the notch also opens once so the rail is discoverable. --pin keeps
+    /// it open regardless of mouse position.
     func expandNowIfNeeded() {
-        if CommandLine.arguments.contains("--expand") {
+        if CommandLine.arguments.contains("--expand") || CommandLine.arguments.contains("--pin") {
             interaction.isExpanded = true
+            if CommandLine.arguments.contains("--pin") { interaction.pinnedOpen = true }
         } else if !UserDefaults.standard.bool(forKey: "notchly.hasLaunched") {
             UserDefaults.standard.set(true, forKey: "notchly.hasLaunched")
             interaction.isExpanded = true
         }
     }
+
+    func expand() { expandNowIfNeeded() }
+    func pin() { expandNowIfNeeded() }
 
     func setSide(_ side: NotchPanelSide) {
         panel.setSide(side)

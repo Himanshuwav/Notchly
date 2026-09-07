@@ -4,13 +4,13 @@ import SwiftUI
 
 enum RailLayout {
     static let railWidth: CGFloat = 72
-    static let tabWidth: CGFloat = 24
-    static let collapsedHeight: CGFloat = 76
-    static let itemPitch: CGFloat = 80
-    static let itemSize: CGFloat = 76
-    static let topInset: CGFloat = 48
-    static let settingsZone: CGFloat = 84
-    static let popoverWidth: CGFloat = 312
+    static let tabWidth: CGFloat = 22
+    static let collapsedHeight: CGFloat = 64
+    static let itemPitch: CGFloat = 76
+    static let itemSize: CGFloat = 72
+    static let topInset: CGFloat = 40
+    static let settingsZone: CGFloat = 56
+    static let popoverWidth: CGFloat = 300
 
     static func railHeight(for count: Int) -> CGFloat {
         topInset + CGFloat(max(count, 1)) * itemPitch + settingsZone
@@ -110,7 +110,7 @@ struct NotchRootView: View {
         return CGFloat(index) * RailLayout.itemPitch + 16
     }
 
-    private var popoverPointerY: CGFloat { 70 }
+    private var popoverPointerY: CGFloat { 60 }
 
     private var rail: some View {
         let isLeft = settings.side == .left
@@ -151,8 +151,10 @@ struct NotchRootView: View {
             .scaleEffect(expanded ? 1 : 0.85, anchor: isLeft ? .topLeading : .topTrailing)
 
             if expanded {
+                // Tucked into the bottom of the rail, centered across its width.
                 settingsCornerButton
-                    .offset(y: RailLayout.railHeight(for: count) - 132)
+                    .frame(width: RailLayout.railWidth)
+                    .offset(y: RailLayout.railHeight(for: count) - 54)
             }
 
             if !expanded {
@@ -220,12 +222,13 @@ struct NotchRootView: View {
         } label: {
             ZStack {
                 ThemedGlass(shape: Circle())
-                    .frame(width: 44, height: 44)
-                    .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                    .frame(width: 40, height: 40)
+                    .overlay(Circle().stroke(Color.white.opacity(0.24), lineWidth: 1))
                 Image(systemName: "gearshape")
-                    .font(.system(size: 18, weight: .medium))
+                    .font(.system(size: 17, weight: .medium))
                     .foregroundStyle(.white)
             }
+            .shadow(color: .black.opacity(0.4), radius: 5, y: 1)
         }
         .buttonStyle(.plain)
     }
@@ -375,11 +378,11 @@ struct RailItemView: View {
                         .offset(x: 15, y: -15)
                 }
                 Image(systemName: state.id.symbolName)
-                    .font(.system(size: 15, weight: .bold))
+                    .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(.white.opacity(state.status == .ok ? 0.95 : 0.55))
                     .scaleEffect(state.isWorking ? 1.04 : 1.0)
             }
-            .frame(width: 42, height: 42)
+            .frame(width: 38, height: 38)
             .scaleEffect(isHovered ? 1.06 : 1.0)
             .animation(.spring(response: 0.28, dampingFraction: 0.8), value: isHovered)
 

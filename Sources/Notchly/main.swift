@@ -15,7 +15,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppDelegate.shared = self
         store = UsageStore()
         controller = NotchPanelController(side: AppSettings.shared.side)
-        controller.expandNowIfNeeded()
+        // Hidden debug hooks.
+        if CommandLine.arguments.contains("--expand") {
+            controller.expand()
+        } else if CommandLine.arguments.contains("--pin") {
+            controller.pin()
+        } else if !UserDefaults.standard.bool(forKey: "notchly.hasLaunched") {
+            UserDefaults.standard.set(true, forKey: "notchly.hasLaunched")
+            controller.expand()
+        }
+        if CommandLine.arguments.contains("--settings") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.openSettings() }
+        }
         controller.host(store: store)
         store.start()
 
@@ -69,11 +80,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func openSettings() {
         if settingsWindow == nil {
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 480, height: 380),
-                styleMask: [.titled, .closable],
+                contentRect: NSRect(x: 0, y: 0, width: 480, height: 600),
+                styleMask: [.titled, .closable, .resizable],
                 backing: .buffered, defer: false
             )
             window.title = "Notchly Settings"
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.backgroundColor = NSColor(calibratedWhite: 0.07, alpha: 1)
             window.contentView = NSHostingView(rootView: SettingsView(store: store))
             window.center()
             window.isReleasedWhenClosed = false
