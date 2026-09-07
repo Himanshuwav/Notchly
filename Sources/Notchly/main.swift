@@ -7,41 +7,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static var retainedDelegate: AppDelegate?
 
     private var store: UsageStore!
-    private var panel: NotchPanel!
+    private var controller: NotchPanelController!
     private var settingsWindow: NSWindow?
     private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
         store = UsageStore()
-
-        panel = NotchPanel(store: store, side: AppSettings.shared.side)
-        panel.orderFrontRegardless()
+        controller = NotchPanelController(side: AppSettings.shared.side)
+        controller.expandNowIfNeeded()
+        controller.host(store: store)
         store.start()
-
-        // Hidden debug hook: --expand opens the notch on launch.
-        if CommandLine.arguments.contains("--expand") {
-            panel.setExpanded(true)
-        }
 
         setupStatusItem()
 
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        NotificationCenter.default.addObserver(
+            forName: .openNotchlySettings, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.panel.screenDidChange()
+            Task { @MainActor [weak self] in self?.openSettings() }
+        }
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: OperationQueue.main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.store?.refreshAll() }
         }
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.panel.screenDidChange()
+            Task { @MainActor [weak self] in self?.controller?.panel.place() }
         }
-    }
-
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        openSettings()
-        return true
     }
 
     private func setupStatusItem() {
@@ -59,18 +55,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func refreshClicked() { store.refreshAll() }
     @objc private func settingsClicked() { openSettings() }
-    @objc private func quitClicked() { NSApp.terminate(nil) }
+    @objc private func quitClicked() {
+        controller.teardown()
+        NSApp.terminate(nil)
+    }
 
     @MainActor
-    func applySide(_ side: NotchPanel.Side) {
-        panel.setSide(side)
+    func applySide(_ side: NotchPanelSide) {
+        controller.setSide(side)
     }
 
     @MainActor
     func openSettings() {
         if settingsWindow == nil {
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 440, height: 320),
+                contentRect: NSRect(x: 0, y: 0, width: 480, height: 380),
                 styleMask: [.titled, .closable],
                 backing: .buffered, defer: false
             )

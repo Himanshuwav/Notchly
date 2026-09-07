@@ -40,7 +40,38 @@ enum CredFile {
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
+    static func writeJSON(_ path: String, _ object: [String: Any]) {
+        guard let out = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) else { return }
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        fm.createFile(atPath: path, contents: out, attributes: [.posixPermissions: 0o600])
+    }
+
     static var home: String { NSHomeDirectory() }
+
+    /// Modification time of the most recently touched file under a directory.
+    static func newestModification(in dir: String, pathSuffix: String? = nil, directoriesOnly: Bool = false) -> Date? {
+        let fm = FileManager.default
+        guard let en = fm.enumerator(atPath: dir) else { return nil }
+        var newest: Date?
+        while let rel = en.nextObject() as? String {
+            if let suffix = pathSuffix, !rel.hasSuffix(suffix) { continue }
+            let full = dir + "/" + rel
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: full, isDirectory: &isDir)
+            if directoriesOnly != isDir.boolValue { continue }
+            if let attrs = try? fm.attributesOfItem(atPath: full),
+               let mtime = attrs[.modificationDate] as? Date {
+                if newest == nil || mtime > newest! { newest = mtime }
+            }
+        }
+        return newest
+    }
+
+    static func isRecentlyActive(_ date: Date?, within seconds: TimeInterval = 180) -> Bool {
+        guard let date else { return false }
+        return Date().timeIntervalSince(date) < seconds
+    }
 }
 
 let isoParser: ISO8601DateFormatter = {
@@ -56,7 +87,7 @@ func parseDate(_ any: Any?) -> Date? {
     return isoParser.date(from: s) ?? isoParserNoFrac.date(from: s)
 }
 
-/// Normalize a utilization number that may arrive as 0...1, 0...100, or 0.0...1.0.
+/// Normalize a utilization number that may arrive as 0...1 or 0...100.
 func normalizeUsed(_ any: Any?) -> Double? {
     guard let v = any as? Double else { return nil }
     let pct = v <= 1.0 ? v * 100 : v
@@ -93,32 +124,92 @@ extension UsageProvider {
     func baseState() -> ProviderState { ProviderState(id: id, status: .reading) }
 }
 
-// MARK: - Claude
+// MARK: - Claude (multi-account)
 
 struct ClaudeProvider: UsageProvider {
     let id: ProviderID = .claude
 
-    private var credPath: String { CredFile.home + "/.claude/.credentials.json" }
+    private var mainCredPath: String { CredFile.home + "/.claude/.credentials.json" }
+
+    /// Main Claude Code login plus any extra accounts imported in Settings.
+    private var accountPaths: [String] {
+        var paths: [String] = []
+        if FileManager.default.fileExists(atPath: mainCredPath) { paths.append(mainCredPath) }
+        let extra = UserDefaults.standard.stringArray(forKey: "claudeCredPaths") ?? []
+        for p in extra where FileManager.default.fileExists(atPath: p) && !paths.contains(p) {
+            paths.append(p)
+        }
+        return paths
+    }
 
     func refresh() async -> ProviderState {
         var state = baseState()
-        guard let creds = CredFile.readJSON(credPath),
-              let oauth = creds["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String else {
+        state.isWorking = CredFile.isRecentlyActive(
+            CredFile.newestModification(in: CredFile.home + "/.claude/projects", pathSuffix: ".jsonl"))
+
+        let paths = accountPaths
+        guard !paths.isEmpty else {
             state.status = .signedOut
             state.note = "Sign in to Claude Code (terminal) to read usage"
             return state
         }
 
+        var windows: [UsageWindow] = []
+        var accountErrors = 0
+        for (idx, path) in paths.enumerated() {
+            let multi = paths.count > 1
+            let accountName = multi ? "Account \(idx + 1)" : nil
+            switch await fetchAccount(credPath: path) {
+            case .ok(let fetched):
+                for var w in fetched {
+                    w.account = accountName
+                    windows.append(w)
+                }
+            case .failure(let failure):
+                accountErrors += 1
+                state.note = failure
+                _ = multi
+            }
+        }
+
+        guard !windows.isEmpty else {
+            if accountErrors > 0 {
+                state.status = .error("Could not read \(accountErrors) Claude account(s)")
+                if state.note.isEmpty { state.note = "Open Claude Code to refresh the login" }
+            } else {
+                state.status = .signedOut
+                state.note = "Sign in to Claude Code to read usage"
+            }
+            return state
+        }
+
+        state.status = .ok
+        state.windows = windows
+        state.updatedAt = Date()
+        if state.note.isEmpty {
+            state.note = paths.count > 1 ? "\(paths.count) Claude accounts" : "Live from Anthropic"
+        }
+        return state
+    }
+
+    private enum ClaudeOutcome {
+        case ok([UsageWindow])
+        case failure(String)
+    }
+
+    private func fetchAccount(credPath: String) async -> ClaudeOutcome {
+        guard let creds = CredFile.readJSON(credPath),
+              let oauth = creds["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String else {
+            return .failure("No Claude credentials at \(credPath)")
+        }
+
         var token2 = token
-        // Refresh if the stored token is within a minute of expiring (ms epoch).
         if let expires = oauth["expiresAt"] as? Double, Date().timeIntervalSince1970 * 1000 > expires - 60_000 {
-            if let refreshed = await refreshClaudeToken(oauth: oauth) {
+            if let refreshed = await refreshClaudeToken(oauth: oauth, credPath: credPath) {
                 token2 = refreshed
             } else {
-                state.status = .error("Token expired — run `claude` once to refresh")
-                state.note = "Open Claude Code to refresh the login"
-                return state
+                return .failure("Claude login expired — open Claude Code once to refresh")
             }
         }
 
@@ -129,42 +220,27 @@ struct ClaudeProvider: UsageProvider {
         ])
         switch result {
         case .failure(let err):
-            if case .http(401) = err {
-                state.status = .signedOut
-                state.note = "Claude Code login is no longer valid"
-            } else {
-                state.status = .error(err.message)
-                state.note = "Could not reach Anthropic usage API"
-            }
+            if case .http(401) = err { return .failure("Claude Code login is no longer valid") }
+            return .failure("Could not reach Anthropic (\(err.message))")
         case .success(let obj):
-            guard let map = obj as? [String: Any] else {
-                state.status = .error("Unexpected payload")
-                return state
-            }
+            guard let map = obj as? [String: Any] else { return .failure("Unexpected Anthropic payload") }
             var windows: [UsageWindow] = []
             for key in ["five_hour", "seven_day", "seven_day_opus", "seven_day_oauth_apps"] {
                 guard let w = map[key] as? [String: Any],
                       let used = normalizeUsed(w["utilization"] ?? w["used_percent"]) else { continue }
                 windows.append(UsageWindow(
-                    id: key,
+                    id: "\(credPath.hashValue)-\(key)",
                     label: friendlyWindowLabel(id: key, minutes: nil),
                     usedPercent: used,
                     resetsAt: parseDate(w["resets_at"] ?? w["resetsAt"])
                 ))
             }
-            guard !windows.isEmpty else {
-                state.status = .error("No usage windows in payload")
-                return state
-            }
-            state.status = .ok
-            state.windows = windows
-            state.updatedAt = Date()
-            state.note = "Live from Anthropic"
+            if windows.isEmpty { return .failure("No usage windows in Anthropic payload") }
+            return .ok(windows)
         }
-        return state
     }
 
-    private func refreshClaudeToken(oauth: [String: Any]) async -> String? {
+    private func refreshClaudeToken(oauth: [String: Any], credPath: String) async -> String? {
         guard let refreshToken = oauth["refreshToken"] as? String else { return nil }
         guard let url = URL(string: "https://platform.claude.com/v1/oauth/token") else { return nil }
         var req = URLRequest(url: url)
@@ -181,7 +257,6 @@ struct ClaudeProvider: UsageProvider {
               let http = resp as? HTTPURLResponse, http.statusCode == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let newToken = obj["access_token"] as? String else { return nil }
-        // Persist the refreshed pair back where Claude Code keeps it.
         var updated = oauth
         updated["accessToken"] = newToken
         if let rt = obj["refresh_token"] as? String { updated["refreshToken"] = rt }
@@ -190,13 +265,7 @@ struct ClaudeProvider: UsageProvider {
         }
         var file = CredFile.readJSON(credPath) ?? [:]
         file["claudeAiOauth"] = updated
-        if let out = try? JSONSerialization.data(withJSONObject: file, options: [.prettyPrinted, .sortedKeys]) {
-            try? FileManager.default.createDirectory(atPath: (credPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
-            let fm = FileManager.default
-            if fm.createFile(atPath: credPath, contents: out, attributes: [.posixPermissions: 0o600]) {
-                // replaced
-            }
-        }
+        CredFile.writeJSON(credPath, file)
         return newToken
     }
 }
@@ -210,6 +279,9 @@ struct CodexProvider: UsageProvider {
 
     func refresh() async -> ProviderState {
         var state = baseState()
+        state.isWorking = CredFile.isRecentlyActive(
+            CredFile.newestModification(in: sessionsDir, pathSuffix: ".jsonl"))
+
         let fm = FileManager.default
         guard fm.fileExists(atPath: CredFile.home + "/.codex") else {
             state.status = .notInstalled
@@ -222,7 +294,6 @@ struct CodexProvider: UsageProvider {
             return state
         }
 
-        // Newest rollouts first; rate-limit snapshots land in the freshest one.
         guard let files = latestRollouts(limit: 40), !files.isEmpty else {
             state.status = .ok
             state.note = "No Codex threads on this machine yet"
@@ -301,7 +372,6 @@ struct CodexProvider: UsageProvider {
         guard let text = String(data: read, encoding: .utf8) else { return nil }
         for line in text.split(separator: "\n").reversed() {
             guard line.contains("rate_limits") else { continue }
-            // Lines are JSONL but may be truncated at the head of the slice.
             var s = line
             while s.first != "{" && s.count > 1 { s.removeFirst() }
             guard let obj = try? JSONSerialization.jsonObject(with: Data(s.utf8)) else { continue }
@@ -320,9 +390,10 @@ struct FactoryProvider: UsageProvider {
 
     func refresh() async -> ProviderState {
         var state = baseState()
-        let fm = FileManager.default
+        state.isWorking = CredFile.isRecentlyActive(
+            CredFile.newestModification(in: sessionsDir, directoriesOnly: true), within: 300)
 
-        // Local activity always fills the card, key or not.
+        let fm = FileManager.default
         let activity = Self.todaySessionCount(in: sessionsDir)
 
         if let key = Keychain.get(account: "factory-api-key"), !key.isEmpty {
@@ -370,7 +441,6 @@ struct FactoryProvider: UsageProvider {
             return state
         }
 
-        // No key yet: still show local activity so the ring is not dead weight.
         state.status = .needsSetup
         state.note = activity > 0
             ? "\(activity) droid sessions today — add an API key for live limits"
@@ -399,14 +469,13 @@ struct FactoryProvider: UsageProvider {
     }
 }
 
-// MARK: - Gemini / Antigravity (Google AI Pro)
+// MARK: - Gemini / Antigravity (Google AI Pro, multi-account)
 
 struct GeminiProvider: UsageProvider {
     let id: ProviderID = .gemini
 
     private var defaultCredPath: String { CredFile.home + "/.gemini/oauth_creds.json" }
 
-    /// Paths of every Google account the user registered (each an oauth_creds.json).
     private var accountPaths: [String] {
         var paths: [String] = []
         if FileManager.default.fileExists(atPath: defaultCredPath) { paths.append(defaultCredPath) }
@@ -444,17 +513,16 @@ struct GeminiProvider: UsageProvider {
             case .success(let obj):
                 guard let map = obj as? [String: Any],
                       let buckets = map["buckets"] as? [[String: Any]] else { failures += 1; continue }
-                // Worst remaining fraction across models = the binding limit.
                 var worst = 1.0
                 for b in buckets {
                     if let rem = b["remainingFraction"] as? Double { worst = min(worst, rem) }
                 }
-                let label = paths.count > 1 ? "Account \(idx + 1)" : "Gemini quota"
                 windows.append(UsageWindow(
                     id: "gemini-\(idx)",
-                    label: label,
+                    label: paths.count > 1 ? "Account \(idx + 1)" : "Gemini quota",
                     usedPercent: max(0, min(100, (1 - worst) * 100)),
-                    resetsAt: parseDate(map["resetTime"] ?? map["nextReset"])
+                    resetsAt: parseDate(map["resetTime"] ?? map["nextReset"]),
+                    account: paths.count > 1 ? "Account \(idx + 1)" : nil
                 ))
             }
         }

@@ -5,7 +5,6 @@ import AppKit
 @MainActor
 final class UsageStore: ObservableObject {
     @Published var states: [ProviderID: ProviderState] = [:]
-    @Published var expanded: Bool = false
 
     private var timer: Timer?
     private var providers: [UsageProvider]
@@ -46,7 +45,9 @@ final class UsageStore: ObservableObject {
             let id = provider.id
             Task { [weak self] in
                 let fresh = await provider.refresh()
-                print("[Notchly] \(id.rawValue): status=\(fresh.status) windows=\(fresh.windows.map { "\($0.label) \(Int($0.usedPercent))%" }) note=\(fresh.note)")
+                #if DEBUG
+                print("[Notchly] \(id.rawValue): status=\(fresh.status) windows=\(fresh.windows.map { "\($0.label) \(Int($0.usedPercent))%" }) working=\(fresh.isWorking)")
+                #endif
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.states[id] = fresh
