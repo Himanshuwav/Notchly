@@ -1,94 +1,475 @@
 import AppKit
+import Observation
 import SwiftUI
 
-// MARK: - Interaction state
+// MARK: - Glass
 
-@MainActor
-final class NotchInteraction: ObservableObject {
-    @Published var isExpanded = false
-    @Published var hoveredIndex: Int?
-    @Published var pinnedOpen = false
-    @Published var providerCount = 0
+struct GlassMaterialView: NSViewRepresentable {
+    let tint: ThemeColor
 
-    func collapse() {
-        isExpanded = false
-        hoveredIndex = nil
-        pinnedOpen = false
-    }
-}
-
-// MARK: - Panel
-
-/// A fixed-size transparent canvas pinned to the chosen screen edge. Only the
-/// glass rail / island / popover content is hit-testable, so the rest of the
-/// canvas lets clicks fall through to whatever is underneath.
-final class NotchPanel: NSPanel {
-    static let sideCanvas = CGSize(width: 400, height: 480)
-    static let topCanvas = CGSize(width: 480, height: 360)
-
-    private(set) var side: NotchPanelSide
-
-    init(side: NotchPanelSide) {
-        self.side = side
-        let canvas = side == .top ? Self.topCanvas : Self.sideCanvas
-        super.init(contentRect: NSRect(origin: .zero, size: canvas),
-                   styleMask: [.borderless, .nonactivatingPanel],
-                   backing: .buffered, defer: false)
-        isOpaque = false
-        backgroundColor = .clear
-        hasShadow = false
-        level = .statusBar
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-        hidesOnDeactivate = false
-        isMovable = false
-        place()
-    }
-
-    func setSide(_ side: NotchPanelSide) {
-        self.side = side
-        let canvas = side == .top ? Self.topCanvas : Self.sideCanvas
-        setFrame(NSRect(origin: .zero, size: canvas), display: false)
-        place()
-    }
-
-    /// Anchor the canvas to its edge; the rail is drawn inside it.
-    func place() {
-        guard let screen = NSScreen.main else { return }
-        let f = screen.frame
-        let canvas = side == .top ? Self.topCanvas : Self.sideCanvas
-        let origin: CGPoint
-        switch side {
-        case .right:
-            origin = CGPoint(x: f.maxX - canvas.width, y: f.midY - canvas.height / 2)
-        case .left:
-            origin = CGPoint(x: f.minX, y: f.midY - canvas.height / 2)
-        case .top:
-            origin = CGPoint(x: f.midX - canvas.width / 2, y: f.maxY - canvas.height)
+    func makeNSView(context: Context) -> NSView {
+        if #available(macOS 26.0, *), AppSettings.activeWindowStyle == .liquidGlass {
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.cornerRadius = 0
+            glass.tintColor = tint.nsColor.withAlphaComponent(0.14)
+            return glass
         }
-        setFrame(NSRect(origin: origin, size: canvas), display: true)
-        contentView?.frame = NSRect(origin: .zero, size: canvas)
+
+        if AppSettings.activeWindowStyle == .solid {
+            let solid = NSView()
+            solid.wantsLayer = true
+            solid.layer?.backgroundColor = tint.solidNSColor.cgColor
+            return solid
+        }
+
+        let translucent = NSVisualEffectView()
+        translucent.material = .hudWindow
+        translucent.blendingMode = .behindWindow
+        translucent.state = .active
+        translucent.wantsLayer = true
+        translucent.layer?.backgroundColor = tint.nsColor.withAlphaComponent(0.14).cgColor
+        return translucent
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        if #available(macOS 26.0, *), let glass = nsView as? NSGlassEffectView {
+            glass.tintColor = tint.nsColor.withAlphaComponent(0.14)
+        } else if let translucent = nsView as? NSVisualEffectView {
+            translucent.layer?.backgroundColor = tint.nsColor.withAlphaComponent(0.14).cgColor
+        }
     }
 }
 
-enum NotchPanelSide: String {
-    case left, right, top
+struct ThemedGlass<S: Shape>: View {
+    let shape: S
+    @AppStorage(AppSettings.themeColorKey) private var themeRaw = ThemeColor.red.rawValue
+
+    private var currentTheme: ThemeColor {
+        ThemeColor(rawValue: themeRaw) ?? .red
+    }
+
+    var body: some View {
+        if #available(macOS 26.0, *), AppSettings.activeWindowStyle == .liquidGlass {
+            shape
+                .fill(Color.clear)
+                .glassEffect(
+                    .regular
+                        .tint(currentTheme.color.opacity(0.14))
+                        .interactive(),
+                    in: shape
+                )
+                .overlay(glassReflection)
+                .overlay(shape.stroke(Color.white.opacity(0.22), lineWidth: 0.8))
+        } else if AppSettings.activeWindowStyle == .solid {
+            shape.fill(currentTheme.solidColor)
+        } else {
+            shape
+                .fill(Color.clear)
+                .background(GlassMaterialView(tint: currentTheme))
+                .clipShape(shape)
+                .overlay(glassReflection)
+                .overlay(shape.stroke(Color.white.opacity(0.20), lineWidth: 0.8))
+        }
+    }
+
+    private var glassReflection: some View {
+        shape
+            .fill(
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(0.18),
+                        Color.white.opacity(0.06),
+                        Color.clear,
+                        Color.white.opacity(0.04)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+            .blendMode(.screen)
+            .allowsHitTesting(false)
+    }
 }
 
-// MARK: - Hosting & tracking
+// MARK: - Shapes
+
+/// Smooth Apple-style curved notch with true concave entry scoops and convex shoulders.
+struct RightEdgeNotchShape: Shape {
+    var flareWidth: CGFloat = 24
+    var flareHeight: CGFloat = 36
+    var cornerRadius: CGFloat = 28
+
+    var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>> {
+        get {
+            AnimatablePair(flareWidth, AnimatablePair(flareHeight, cornerRadius))
+        }
+        set {
+            flareWidth = newValue.first
+            flareHeight = newValue.second.first
+            cornerRadius = newValue.second.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let w = rect.width
+        let h = rect.height
+        let fh = min(flareHeight, h * 0.35)
+        let cr = min(cornerRadius, max(2, (h - 2 * fh) * 0.5))
+        let fw = min(flareWidth, max(2, w * 0.45))
+        let k: CGFloat = 0.5522847
+
+        // 1. Start at top-right on the screen boundary
+        path.move(to: CGPoint(x: rect.maxX, y: rect.minY))
+
+        // 2. Top-right concave scoop from (maxX, minY) to (maxX - fw, minY + fh)
+        path.addCurve(
+            to: CGPoint(x: rect.maxX - fw, y: rect.minY + fh),
+            control1: CGPoint(x: rect.maxX, y: rect.minY + fh * k),
+            control2: CGPoint(x: rect.maxX - fw * (1 - k), y: rect.minY + fh)
+        )
+
+        // 3. Top horizontal straight bridge
+        path.addLine(to: CGPoint(x: rect.minX + cr, y: rect.minY + fh))
+
+        // 4. Top-left convex rounded shoulder
+        path.addCurve(
+            to: CGPoint(x: rect.minX, y: rect.minY + fh + cr),
+            control1: CGPoint(x: rect.minX + cr * (1 - k), y: rect.minY + fh),
+            control2: CGPoint(x: rect.minX, y: rect.minY + fh + cr * (1 - k))
+        )
+
+        // 5. Left straight vertical boundary
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - fh - cr))
+
+        // 6. Bottom-left convex rounded shoulder
+        path.addCurve(
+            to: CGPoint(x: rect.minX + cr, y: rect.maxY - fh),
+            control1: CGPoint(x: rect.minX, y: rect.maxY - fh - cr * (1 - k)),
+            control2: CGPoint(x: rect.minX + cr * (1 - k), y: rect.maxY - fh)
+        )
+
+        // 7. Bottom horizontal straight bridge
+        path.addLine(to: CGPoint(x: rect.maxX - fw, y: rect.maxY - fh))
+
+        // 8. Bottom-right concave scoop from (maxX - fw, maxY - fh) to (maxX, maxY)
+        path.addCurve(
+            to: CGPoint(x: rect.maxX, y: rect.maxY),
+            control1: CGPoint(x: rect.maxX - fw * (1 - k), y: rect.maxY - fh),
+            control2: CGPoint(x: rect.maxX, y: rect.maxY - fh * k)
+        )
+
+        // 9. Close along screen boundary
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.closeSubpath()
+
+        return path
+    }
+}
+
+/// The rail silhouette, mirrored when it is docked to the left edge.
+struct OrientedRailShape: Shape {
+    var flareWidth: CGFloat
+    var flareHeight: CGFloat
+    var cornerRadius: CGFloat
+    var mirrored: Bool
+
+    var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>> {
+        get { AnimatablePair(flareWidth, AnimatablePair(flareHeight, cornerRadius)) }
+        set {
+            flareWidth = newValue.first
+            flareHeight = newValue.second.first
+            cornerRadius = newValue.second.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let path = RightEdgeNotchShape(
+            flareWidth: flareWidth,
+            flareHeight: flareHeight,
+            cornerRadius: cornerRadius
+        ).path(in: rect)
+        guard mirrored else { return path }
+        return path.applying(CGAffineTransform(
+            a: -1, b: 0, c: 0, d: 1,
+            tx: rect.minX + rect.maxX, ty: 0
+        ))
+    }
+}
+
+/// Smooth Apple-style Top Notch shape with true concave ear fillets and rounded bottom corners.
+struct TopEdgeNotchShape: Shape {
+    var flareWidth: CGFloat = 16
+    var flareHeight: CGFloat = 16
+    var cornerRadius: CGFloat = 20
+
+    var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>> {
+        get { AnimatablePair(flareWidth, AnimatablePair(flareHeight, cornerRadius)) }
+        set {
+            flareWidth = newValue.first
+            flareHeight = newValue.second.first
+            cornerRadius = newValue.second.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let w = rect.width
+        let h = rect.height
+        let fw = min(flareWidth, w * 0.25)
+        let fh = min(flareHeight, h * 0.4)
+        let cr = min(cornerRadius, max(2, min((w - 2 * fw) * 0.5, h - fh)))
+        let k: CGFloat = 0.5522847
+
+        // 1. Start at top-left screen boundary
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+
+        // 2. Top-left concave ear fillet from (minX, minY) to (minX + fw, minY + fh)
+        if fw > 0 && fh > 0 {
+            path.addCurve(
+                to: CGPoint(x: rect.minX + fw, y: rect.minY + fh),
+                control1: CGPoint(x: rect.minX + fw * (1 - k), y: rect.minY),
+                control2: CGPoint(x: rect.minX + fw, y: rect.minY + fh * k)
+            )
+        } else {
+            path.addLine(to: CGPoint(x: rect.minX + fw, y: rect.minY + fh))
+        }
+
+        // 3. Left straight vertical side
+        path.addLine(to: CGPoint(x: rect.minX + fw, y: rect.maxY - cr))
+
+        // 4. Bottom-left convex rounded corner
+        path.addCurve(
+            to: CGPoint(x: rect.minX + fw + cr, y: rect.maxY),
+            control1: CGPoint(x: rect.minX + fw, y: rect.maxY - cr * (1 - k)),
+            control2: CGPoint(x: rect.minX + fw + cr * (1 - k), y: rect.maxY)
+        )
+
+        // 5. Bottom horizontal straight edge
+        path.addLine(to: CGPoint(x: rect.maxX - fw - cr, y: rect.maxY))
+
+        // 6. Bottom-right convex rounded corner
+        path.addCurve(
+            to: CGPoint(x: rect.maxX - fw, y: rect.maxY - cr),
+            control1: CGPoint(x: rect.maxX - fw - cr * (1 - k), y: rect.maxY),
+            control2: CGPoint(x: rect.maxX - fw, y: rect.maxY - cr * (1 - k))
+        )
+
+        // 7. Right straight vertical side
+        path.addLine(to: CGPoint(x: rect.maxX - fw, y: rect.minY + fh))
+
+        // 8. Top-right concave ear fillet from (maxX - fw, minY + fh) to (maxX, minY)
+        if fw > 0 && fh > 0 {
+            path.addCurve(
+                to: CGPoint(x: rect.maxX, y: rect.minY),
+                control1: CGPoint(x: rect.maxX - fw, y: rect.minY + fh * k),
+                control2: CGPoint(x: rect.maxX - fw * (1 - k), y: rect.minY)
+            )
+        } else {
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        }
+
+        // 9. Close along top boundary
+        path.closeSubpath()
+        return path
+    }
+}
+
+/// Bottom-edge notch: the top is rounded while the attached bottom edge
+/// uses the same concave ear treatment as the hardware notch.
+struct BottomIslandCapsule: Shape {
+    var flareWidth: CGFloat = 24
+    var flareHeight: CGFloat = 20
+    var cornerRadius: CGFloat = 24
+
+    var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>> {
+        get { AnimatablePair(flareWidth, AnimatablePair(flareHeight, cornerRadius)) }
+        set {
+            flareWidth = newValue.first
+            flareHeight = newValue.second.first
+            cornerRadius = newValue.second.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let path = TopEdgeNotchShape(
+            flareWidth: flareWidth,
+            flareHeight: flareHeight,
+            cornerRadius: cornerRadius
+        ).path(in: rect)
+        return path.applying(CGAffineTransform(
+            a: 1, b: 0, c: 0, d: -1,
+            tx: 0, ty: rect.minY + rect.maxY
+        ))
+    }
+}
+
+/// Geometry and metrics layout for the dynamic Bottom Notch bar.
+enum HorizontalBarLayout {
+    static let itemWidth: CGFloat = 68
+    static let itemSpacing: CGFloat = 10
+    static let dividerWidth: CGFloat = 1
+    static let dividerSpacing: CGFloat = 8
+    static let settingsWidth: CGFloat = 65
+    static let sidePadding: CGFloat = 34
+    static let barHeight: CGFloat = 74
+    static let collapsedWidth: CGFloat = 64
+    static let collapsedHeight: CGFloat = 20
+
+    static func expandedWidth(for count: Int) -> CGFloat {
+        let actualCount = max(1, count)
+        let itemsWidth = CGFloat(actualCount) * itemWidth + CGFloat(max(0, actualCount - 1)) * itemSpacing
+        // The settings button is positioned in the curved end-cap, outside
+        // the provider row, so it must not reserve empty row space.
+        return itemsWidth + (sidePadding * 2)
+    }
+
+    static func itemCenterX(for index: Int, totalCount: Int) -> CGFloat {
+        let totalW = expandedWidth(for: totalCount)
+        let startX = -totalW / 2 + sidePadding
+        return startX + CGFloat(index) * (itemWidth + itemSpacing) + (itemWidth / 2)
+    }
+
+    static func settingsCenterX(for totalCount: Int) -> CGFloat {
+        let totalW = expandedWidth(for: totalCount)
+        return totalW / 2 + 4
+    }
+}
+
+/// Popover card with an animatable triangular callout beak pointing at the hovered item.
+struct PopoverCalloutShape: Shape {
+    var pointerY: CGFloat
+    var cornerRadius: CGFloat = 16
+    var pointerWidth: CGFloat = 10
+    var pointerHeight: CGFloat = 18
+    var pointerOnLeft = false
+
+    var animatableData: CGFloat {
+        get { pointerY }
+        set { pointerY = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let r = cornerRadius
+        let pw = pointerWidth
+        let ph = pointerHeight / 2
+
+        let cardRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width - pw, height: rect.height)
+        let clampedPointerY = min(max(pointerY, cardRect.minY + r + ph), cardRect.maxY - r - ph)
+
+        // Top-left
+        path.move(to: CGPoint(x: cardRect.minX + r, y: cardRect.minY))
+
+        // Top edge
+        path.addLine(to: CGPoint(x: cardRect.maxX - r, y: cardRect.minY))
+        path.addArc(
+            center: CGPoint(x: cardRect.maxX - r, y: cardRect.minY + r),
+            radius: r,
+            startAngle: .degrees(-90),
+            endAngle: .degrees(0),
+            clockwise: false
+        )
+
+        // Right edge down to pointer beak top
+        path.addLine(to: CGPoint(x: cardRect.maxX, y: clampedPointerY - ph))
+        // Pointer beak tip
+        path.addLine(to: CGPoint(x: cardRect.maxX + pw, y: clampedPointerY))
+        // Pointer beak bottom
+        path.addLine(to: CGPoint(x: cardRect.maxX, y: clampedPointerY + ph))
+
+        // Right edge down to bottom-right corner
+        path.addLine(to: CGPoint(x: cardRect.maxX, y: cardRect.maxY - r))
+        path.addArc(
+            center: CGPoint(x: cardRect.maxX - r, y: cardRect.maxY - r),
+            radius: r,
+            startAngle: .degrees(0),
+            endAngle: .degrees(90),
+            clockwise: false
+        )
+
+        // Bottom edge
+        path.addLine(to: CGPoint(x: cardRect.minX + r, y: cardRect.maxY))
+        path.addArc(
+            center: CGPoint(x: cardRect.minX + r, y: cardRect.maxY - r),
+            radius: r,
+            startAngle: .degrees(90),
+            endAngle: .degrees(180),
+            clockwise: false
+        )
+
+        // Left edge up to top-left corner
+        path.addLine(to: CGPoint(x: cardRect.minX, y: cardRect.minY + r))
+        path.addArc(
+            center: CGPoint(x: cardRect.minX + r, y: cardRect.minY + r),
+            radius: r,
+            startAngle: .degrees(180),
+            endAngle: .degrees(270),
+            clockwise: false
+        )
+
+        path.closeSubpath()
+        guard pointerOnLeft else { return path }
+        return path.applying(CGAffineTransform(
+            a: -1, b: 0, c: 0, d: 1,
+            tx: rect.minX + rect.maxX, ty: 0
+        ))
+    }
+}
+
+struct VerticalPopoverCalloutShape: Shape {
+    var pointerX: CGFloat
+    var pointerOnTop: Bool
+    var cornerRadius: CGFloat = 16
+    var pointerWidth: CGFloat = 18
+    var pointerHeight: CGFloat = 10
+
+    func path(in rect: CGRect) -> Path {
+        let cardRect = CGRect(
+            x: rect.minX,
+            y: pointerOnTop ? rect.minY + pointerHeight : rect.minY,
+            width: rect.width,
+            height: rect.height - pointerHeight
+        )
+        let clampedX = min(max(pointerX, cardRect.minX + cornerRadius + pointerWidth / 2),
+                           cardRect.maxX - cornerRadius - pointerWidth / 2)
+        var path = Path(roundedRect: cardRect, cornerRadius: cornerRadius)
+        var pointer = Path()
+        if pointerOnTop {
+            pointer.move(to: CGPoint(x: clampedX - pointerWidth / 2, y: cardRect.minY))
+            pointer.addLine(to: CGPoint(x: clampedX, y: rect.minY))
+            pointer.addLine(to: CGPoint(x: clampedX + pointerWidth / 2, y: cardRect.minY))
+        } else {
+            pointer.move(to: CGPoint(x: clampedX - pointerWidth / 2, y: cardRect.maxY))
+            pointer.addLine(to: CGPoint(x: clampedX, y: rect.maxY))
+            pointer.addLine(to: CGPoint(x: clampedX + pointerWidth / 2, y: cardRect.maxY))
+        }
+        pointer.closeSubpath()
+        path.addPath(pointer)
+        return path
+    }
+}
+
+// MARK: - Hosting & Panel
 
 final class TrackingHostingView<Content: View>: NSHostingView<Content> {
     var onExit: (() -> Void)?
-    private var trackingArea: NSTrackingArea?
+    private var panelTrackingArea: NSTrackingArea?
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
-        if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(
+        if let panelTrackingArea {
+            removeTrackingArea(panelTrackingArea)
+        }
+        let panelTrackingArea = NSTrackingArea(
             rect: bounds,
             options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
-            owner: self, userInfo: nil)
-        addTrackingArea(area)
-        trackingArea = area
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(panelTrackingArea)
+        self.panelTrackingArea = panelTrackingArea
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -97,165 +478,1562 @@ final class TrackingHostingView<Content: View>: NSHostingView<Content> {
     }
 }
 
-// MARK: - Controller
+final class NotchPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+        // Keep the overlay in the Space where it was created. In particular, do
+        // not use `.canJoinAllSpaces` or `.fullScreenAuxiliary`: either behavior
+        // would carry the panel into a fullscreen app's Space, which would make
+        // the always-visible mode appear over fullscreen video and windows.
+        collectionBehavior = [.stationary, .ignoresCycle]
+        hidesOnDeactivate = false
+    }
+
+    /// Enough canvas for the rail's items, bottom padding, and the gear that
+    /// hangs under it; grows with provider count instead of clipping them.
+    static func canvasHeight(for providerCount: Int) -> CGFloat {
+        min(860, max(480, CGFloat(providerCount) * 88 + 220))
+    }
+
+    private(set) var currentCanvasHeight: CGFloat = 480
+
+    func setCanvasHeight(_ height: CGFloat) {
+        guard height != currentCanvasHeight else { return }
+        currentCanvasHeight = height
+        place()
+    }
+
+    func place() {
+        let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+        guard let screen else { return }
+        let panelWidth: CGFloat = 640
+        let panelHeight = currentCanvasHeight
+        let position = NotchPosition(rawValue: UserDefaults.standard.string(forKey: AppSettings.notchPositionKey) ?? "") ?? .right
+        let frame = screen.visibleFrame
+        let positionOffset = min(max(UserDefaults.standard.double(forKey: AppSettings.notchPositionOffsetKey), -1), 1)
+        let verticalTravel = max(0, (frame.height - panelHeight - 40) / 2)
+        let horizontalTravel = max(0, (frame.width - panelWidth - 40) / 2)
+        let centeredVerticalOrigin = frame.midY - panelHeight / 2
+
+        // The rail is the right-most 72pt of the canonical panel. Anchor that
+        // rail to the selected screen edge while keeping its default position centered.
+        let origin: CGPoint
+        switch position {
+        case .right:
+            origin = CGPoint(
+                x: frame.maxX - panelWidth,
+                y: centeredVerticalOrigin - positionOffset * verticalTravel)
+        case .leftCenter:
+            origin = CGPoint(
+                x: frame.minX,
+                y: centeredVerticalOrigin - positionOffset * verticalTravel)
+        case .bottomCenter:
+            origin = CGPoint(
+                x: frame.midX - panelWidth / 2 + positionOffset * horizontalTravel,
+                y: frame.minY)
+        }
+
+        setFrame(NSRect(origin: origin, size: NSSize(width: panelWidth, height: panelHeight)), display: true)
+        contentView?.frame = NSRect(origin: .zero, size: NSSize(width: panelWidth, height: panelHeight))
+    }
+}
+
+@MainActor
+@Observable
+final class NotchInteractionState {
+    var isHovered = false
+    var pinnedOpen = false
+    var isDetailVisible = false
+    var isSettingsHovered = false
+    var providerCount = 0
+    var hoveredIndex: Int?
+    var collapseToken = 0
+    var panelFrame: NSRect = .zero
+    var position: NotchPosition = NotchPosition(rawValue: UserDefaults.standard.string(forKey: AppSettings.notchPositionKey) ?? "") ?? .right
+    var displayMode: OverlayDisplayMode = AppSettings.overlayDisplayMode
+}
+
+/// Coalesces the system-wide mouseMoved firehose before it can allocate a
+/// Task + MainActor hop per event (60-120Hz). Thread-safe: monitor callbacks
+/// consult it synchronously on the delivery thread.
+final class MouseMoveThrottle: @unchecked Sendable {
+    /// Minimum time between handled events (~20Hz is plenty for hover).
+    static let minimumInterval: TimeInterval = 0.05
+    /// Minimum cursor travel worth a re-evaluation.
+    static let minimumDistance: CGFloat = 2
+
+    private let lock = NSLock()
+    private var lastHandled = Date.distantPast
+    private var lastLocation = NSPoint.zero
+
+    func shouldHandle(_ event: NSEvent) -> Bool {
+        shouldHandle(at: NSEvent.mouseLocation, now: Date())
+    }
+
+    func shouldHandle(at location: NSPoint, now: Date) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard now.timeIntervalSince(lastHandled) >= Self.minimumInterval else { return false }
+        let dx = location.x - lastLocation.x
+        let dy = location.y - lastLocation.y
+        guard (dx * dx + dy * dy) >= (Self.minimumDistance * Self.minimumDistance) else { return false }
+        lastHandled = now
+        lastLocation = location
+        return true
+    }
+}
 
 @MainActor
 final class NotchPanelController {
-    let panel: NotchPanel
-    let interaction = NotchInteraction()
-
-    private var mouseMonitor: Any?
+    let panel = NotchPanel()
+    private let interaction = NotchInteractionState()
+    private var globalClickMonitor: Any?
+    private var localClickMonitor: Any?
+    private var localGearClickMonitor: Any?
+    private var gearPressArmed = false
+    private var globalMouseMonitor: Any?
     private var localMouseMonitor: Any?
-    private var clickMonitor: Any?
-    private var collapseTask: Task<Void, Never>?
+    private let mouseThrottle = MouseMoveThrottle()
+    private var autoCollapseTask: Task<Void, Never>?
 
-    init(side: NotchPanelSide) {
-        panel = NotchPanel(side: side)
-        startMonitors()
-    }
-
-    /// Mount the SwiftUI content into the panel canvas.
-    func host(store: UsageStore) {
-        let canvas = panel.side == .top ? NotchPanel.topCanvas : NotchPanel.sideCanvas
-        let view = TrackingHostingView(rootView:
-            NotchRootView(store: store, interaction: interaction, controller: self)
-                .environmentObject(AppSettings.shared)
-        )
-        view.frame = NSRect(origin: .zero, size: canvas)
-        view.sizingOptions = []
-        view.autoresizingMask = [.width, .height]
-        panel.contentView = view
-        panel.setContentSize(canvas)
+    func settingsDidChange() {
         panel.place()
-        panel.orderFrontRegardless()
-        updateHover()
+        interaction.position = NotchPosition(rawValue: UserDefaults.standard.string(forKey: AppSettings.notchPositionKey) ?? "") ?? .right
+        interaction.displayMode = AppSettings.overlayDisplayMode
+        interaction.panelFrame = panel.frame
+        interaction.collapseToken &+= 1
     }
 
-    /// Hidden debug hook: --expand opens the notch on launch. On very first
-    /// run the notch also opens once so the rail is discoverable. --pin keeps
-    /// it open regardless of mouse position.
-    func expandNowIfNeeded() {
-        if CommandLine.arguments.contains("--expand") || CommandLine.arguments.contains("--pin") {
-            interaction.isExpanded = true
-            if CommandLine.arguments.contains("--pin") { interaction.pinnedOpen = true }
-        } else if !UserDefaults.standard.bool(forKey: "notchly.hasLaunched") {
-            UserDefaults.standard.set(true, forKey: "notchly.hasLaunched")
-            interaction.isExpanded = true
-        }
+    /// Grows/shrinks the canvas with the number of visible rail items.
+    func syncCanvasHeight(providerCount: Int) {
+        panel.setCanvasHeight(NotchPanel.canvasHeight(for: providerCount))
+        interaction.panelFrame = panel.frame
     }
 
-    func expand() { expandNowIfNeeded() }
-    func pin() { expandNowIfNeeded() }
+    func show(store: UsageStore) {
+        panel.place()
+        interaction.position = NotchPosition(rawValue: UserDefaults.standard.string(forKey: AppSettings.notchPositionKey) ?? "") ?? .right
+        interaction.displayMode = AppSettings.overlayDisplayMode
+        interaction.panelFrame = panel.frame
 
-    func setSide(_ side: NotchPanelSide) {
-        panel.setSide(side)
-        interaction.collapse()
-    }
+        let hostedView = TrackingHostingView(rootView: NotchView(
+            store: store,
+            interaction: interaction
+        ))
 
-    func expandNow() {
-        interaction.isExpanded = true
-    }
-
-    // MARK: regions (screen coordinates)
-
-    /// Collapsed tab + a forgiving corridor toward the screen edge.
-    private func triggerRegion() -> NSRect {
-        let frame = panel.frame
-        switch panel.side {
-        case .right:
-            return NSRect(x: frame.maxX - 88, y: frame.minY, width: 88, height: frame.height)
-        case .left:
-            return NSRect(x: frame.minX, y: frame.minY, width: 88, height: frame.height)
-        case .top:
-            return NSRect(x: frame.midX - 180, y: frame.maxY - 72, width: 360, height: 72)
-        }
-    }
-
-    private func expandedContentRegion() -> NSRect {
-        let frame = panel.frame
-        switch panel.side {
-        case .right:
-            return NSRect(x: frame.maxX - 400, y: frame.minY, width: 400, height: frame.height)
-        case .left:
-            return NSRect(x: frame.minX, y: frame.minY, width: 400, height: frame.height)
-        case .top:
-            return frame
-        }
-    }
-
-    // MARK: mouse tracking
-
-    private func startMonitors() {
-        let mouseMask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .scrollWheel]
-        mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mouseMask) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.updateHover() }
-        }
-        // Global monitors miss events delivered to our own windows; keep hover
-        // working over the panel itself with a local monitor.
-        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { [weak self] event in
-            Task { @MainActor [weak self] in self?.updateHover() }
-            return event
-        }
-        let clickMask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown]
-        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: clickMask) { [weak self] _ in
+        hostedView.onExit = { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self, self.interaction.isExpanded, !self.interaction.pinnedOpen else { return }
-                self.interaction.collapse()
+                guard let self else { return }
+                self.autoCollapseTask?.cancel()
+                self.interaction.isHovered = false
+                self.interaction.isSettingsHovered = false
+                self.interaction.hoveredIndex = nil
+                self.interaction.collapseToken &+= 1
             }
         }
+        panel.contentView = hostedView
+        panel.orderFrontRegardless()
+
+        setupClickOutsideMonitors()
     }
 
-    func updateHover() {
-        let location = NSEvent.mouseLocation
-        let insideTrigger = triggerRegion().contains(location)
-        let insideContent = interaction.isExpanded && expandedContentRegion().contains(location)
+    private func setupClickOutsideMonitors() {
+        if let globalClickMonitor {
+            NSEvent.removeMonitor(globalClickMonitor)
+        }
+        if let localClickMonitor {
+            NSEvent.removeMonitor(localClickMonitor)
+        }
+        if let globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
+        }
+        if let localMouseMonitor {
+            NSEvent.removeMonitor(localMouseMonitor)
+        }
 
-        if insideTrigger || insideContent {
-            cancelCollapse()
-            if !interaction.isExpanded {
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
-                    interaction.isExpanded = true
+        let eventMask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: eventMask) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.collapseFromOutsideClick()
+            }
+        }
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: eventMask) { [weak self] event in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let mouseScreen = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+                if !self.interactionRegion.contains(mouseScreen) {
+                    self.collapseFromOutsideClick()
                 }
             }
-            if interaction.isExpanded && panel.side != .top {
-                interaction.hoveredIndex = hoveredRailIndex(at: location)
+            return event
+        }
+
+        let mouseMask: NSEvent.EventTypeMask = [.mouseMoved]
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mouseMask) { [weak self] event in
+            // Throttle on the monitor thread before allocating a Task + MainActor
+            // hop: mouseMoved fires system-wide at 60-120Hz and each hop was
+            // queueing behind the MainActor serial queue.
+            guard let self, self.mouseThrottle.shouldHandle(event) else { return }
+            Task { @MainActor [weak self] in
+                self?.handleMouseMove(event)
             }
-        } else if interaction.isExpanded && !interaction.pinnedOpen {
-            scheduleCollapse()
+        }
+        // Global monitors do not receive events delivered to this app. The
+        // settings window activates nootch, so keep hover working with a local
+        // monitor whenever the cursor moves over the settings window or panel.
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: mouseMask) { [weak self] event in
+            guard let self, self.mouseThrottle.shouldHandle(event) else { return event }
+            self.handleMouseMove(event)
+            return event
+        }
+
+        // The gear activates from the controller, not SwiftUI hit-testing:
+        // clicks land on the rail glass even where gesture routing is flaky,
+        // and isSettingsHovered is exactly the zone where the gear is visible.
+        localGearClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
+            guard let self, event.window === self.panel else { return event }
+            let mouseScreen = NSEvent.mouseLocation
+            let overGear = self.interaction.isSettingsHovered && self.gearClickRegion().contains(mouseScreen)
+            if event.type == .leftMouseDown {
+                self.gearPressArmed = overGear
+            } else if self.gearPressArmed {
+                self.gearPressArmed = false
+                if overGear {
+                    NotificationCenter.default.post(name: .openNotchlySettings, object: nil)
+                }
+            }
+            return event
         }
     }
 
-    /// Rail items start 48pt from the canvas top and pitch 80pt.
-    private func hoveredRailIndex(at location: CGPoint) -> Int? {
+    private func gearClickRegion() -> NSRect {
         let frame = panel.frame
-        let topOffset = frame.maxY - location.y
-        let rel = topOffset - 48
-        let index = Int(floor(rel / 80))
-        guard rel >= 0, index >= 0, index < interaction.providerCount else { return nil }
-        return index
+        let railBottom = CGFloat(interaction.providerCount) * 88 + 84
+        // Bottom-up screen rect covering the gear zone under the rail.
+        let yMin = frame.maxY - railBottom - 40
+        let xMin = interaction.position == .leftCenter ? frame.minX : frame.maxX - 90
+        return NSRect(x: xMin, y: yMin, width: 90, height: 82)
     }
 
-    func scheduleCollapse() {
-        guard collapseTask == nil else { return }
-        collapseTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 450_000_000)
-            guard let self, !Task.isCancelled else { return }
-            guard !self.interaction.pinnedOpen else { return }
-            withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
-                self.interaction.collapse()
+    private var mouseLocationX: CGFloat { NSEvent.mouseLocation.x }
+    private var mouseLocationY: CGFloat { NSEvent.mouseLocation.y }
+    
+
+    private func handleMouseMove(_ event: NSEvent) {
+        // Hidden overlay must not pay for hover tracking at all.
+        guard interaction.displayMode != .hidden else { return }
+        let location = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+        let frame = panel.frame
+        // Assigning panelFrame wakes every SwiftUI observer, so only publish
+        // material changes instead of once per mouse event.
+        if abs(interaction.panelFrame.origin.x - frame.origin.x) > 0.5
+            || abs(interaction.panelFrame.origin.y - frame.origin.y) > 0.5
+            || abs(interaction.panelFrame.size.width - frame.size.width) > 0.5
+            || abs(interaction.panelFrame.size.height - frame.size.height) > 0.5 {
+            interaction.panelFrame = frame
+        }
+
+        let isInside = interactionRegion.contains(location)
+        guard isInside else {
+            if interaction.isHovered || interaction.pinnedOpen {
+                withAnimation(.spring(response: 0.22, dampingFraction: 0.88)) {
+                    interaction.isHovered = false
+                    interaction.pinnedOpen = false
+                    interaction.isDetailVisible = false
+                    interaction.isSettingsHovered = false
+                    interaction.hoveredIndex = nil
+                    interaction.collapseToken &+= 1
+                }
+                self.autoCollapseTask?.cancel()
             }
-            self.collapseTask = nil
+            return
+        }
+
+        if !interaction.isHovered {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                interaction.isHovered = true
+            }
+        }
+
+        if interaction.position == .bottomCenter {
+            updateHorizontalHover(at: location, in: frame)
+            return
+        }
+
+        let topOffset = frame.maxY - location.y
+        let count = interaction.providerCount
+        // The provider stack ends after its item frames, spacing, and bottom padding.
+        let railBottom = CGFloat(count) * 88 + 84
+        let settingsXRange = interaction.position == .leftCenter
+            ? (frame.minX...(frame.minX + 72))
+            : ((frame.maxX - 72)...frame.maxX)
+        let isOverSettingsButton = interaction.isSettingsHovered &&
+                                   settingsXRange.contains(location.x) &&
+                                   topOffset >= (railBottom - 42) &&
+                                   topOffset <= (railBottom + 30)
+
+        // Activate settings only from the empty space below the provider stack.
+        let bottomCornerXRange = interaction.position == .leftCenter
+            ? (frame.minX...(frame.minX + 90))
+            : ((frame.maxX - 90)...frame.maxX)
+        let isOverBottomCorner = (bottomCornerXRange.contains(location.x) &&
+                                  (topOffset >= railBottom && topOffset <= (railBottom + 80))) ||
+                                 isOverSettingsButton
+
+        if isOverBottomCorner {
+            if !interaction.isSettingsHovered {
+                withAnimation(.spring(response: 0.20, dampingFraction: 0.84)) {
+                    interaction.isSettingsHovered = true
+                    interaction.hoveredIndex = nil
+                    interaction.isDetailVisible = false
+                }
+            }
+        } else {
+            if interaction.isSettingsHovered {
+                withAnimation(.spring(response: 0.20, dampingFraction: 0.84)) {
+                    interaction.isSettingsHovered = false
+                }
+            }
+
+            // Keep the activation corridor close to the visible rail. The rail is
+            // 72pt wide when expanded, so this gives a small, forgiving target
+            // without capturing normal work beside the display edge.
+            let hoverCorridor: CGFloat = 72
+            let isOverRail = interaction.position == .leftCenter
+                ? location.x <= (frame.minX + hoverCorridor)
+                : location.x >= (frame.maxX - hoverCorridor)
+            if isOverRail {
+                guard count > 0 else { return }
+
+                let relY = topOffset - 42
+                let rawIndex = Int(floor(relY / 88))
+                let nextIndex = (relY >= 0 && rawIndex >= 0 && rawIndex < count) ? rawIndex : nil
+
+                if interaction.hoveredIndex != nextIndex {
+                    withAnimation(.spring(response: 0.16, dampingFraction: 0.90)) {
+                        interaction.hoveredIndex = nextIndex
+                        interaction.isDetailVisible = (nextIndex != nil)
+                    }
+                }
+            }
         }
     }
 
-    func cancelCollapse() {
-        collapseTask?.cancel()
-        collapseTask = nil
+    private func updateHorizontalHover(at location: CGPoint, in frame: NSRect) {
+        let count = interaction.providerCount
+        let barHeight = HorizontalBarLayout.barHeight
+        let isWithinBarY = location.y >= frame.minY && location.y <= frame.minY + barHeight + 16
+        let settingsCenterX = frame.midX + HorizontalBarLayout.settingsCenterX(for: count)
+        let isWithinSettingsRegion = location.y >= frame.minY && location.y <= frame.minY + 165
+            && abs(location.x - settingsCenterX) <= 98
+        let isOverSettings = isWithinSettingsRegion
+
+        // If the mouse is within the detail area, maintain the current item.
+        let isWithinPopoverY = location.y > frame.minY + barHeight + 16 && location.y <= frame.minY + 340
+
+        if isWithinPopoverY && interaction.hoveredIndex != nil && interaction.isDetailVisible {
+            return
+        }
+
+        let relX = location.x - frame.midX
+
+        if isOverSettings {
+            if !interaction.isSettingsHovered {
+                withAnimation(.spring(response: 0.20, dampingFraction: 0.84)) {
+                    interaction.isSettingsHovered = true
+                    interaction.hoveredIndex = nil
+                    interaction.isDetailVisible = false
+                }
+            }
+            return
+        }
+
+        if interaction.isSettingsHovered {
+            withAnimation(.spring(response: 0.20, dampingFraction: 0.84)) {
+                interaction.isSettingsHovered = false
+            }
+        }
+
+        guard count > 0, isWithinBarY else { return }
+
+        var foundIndex: Int? = nil
+        for i in 0..<count {
+            let itemCenterX = HorizontalBarLayout.itemCenterX(for: i, totalCount: count)
+            if abs(relX - itemCenterX) <= (HorizontalBarLayout.itemWidth / 2 + 3) {
+                foundIndex = i
+                break
+            }
+        }
+
+        if interaction.hoveredIndex != foundIndex {
+            withAnimation(.spring(response: 0.16, dampingFraction: 0.90)) {
+                interaction.hoveredIndex = foundIndex
+                interaction.isDetailVisible = foundIndex != nil
+            }
+        }
     }
 
-    func teardown() {
-        if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
-        if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
-        if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
+    private var interactionRegion: NSRect {
+        let frame = panel.frame
+        if interaction.position == .bottomCenter {
+            return NSRect(
+                x: frame.midX - 763 / 2,
+                y: frame.minY,
+                width: 763,
+                height: 199
+            )
+        }
+
+        let triggerWidth: CGFloat = 96
+        let triggerRegion = NSRect(
+            x: interaction.position == .leftCenter ? frame.minX : frame.maxX - triggerWidth,
+            y: frame.maxY - 573,
+            width: triggerWidth,
+            height: 573)
+        guard interaction.isHovered || interaction.pinnedOpen else {
+            return triggerRegion
+        }
+
+        guard interaction.isDetailVisible else { return triggerRegion }
+        let detailRegion = NSRect(
+            x: interaction.position == .leftCenter ? frame.minX : frame.maxX - 440,
+            y: frame.maxY - 573,
+            width: 440,
+            height: 573)
+        return triggerRegion.union(detailRegion)
+    }
+
+    private func collapseFromOutsideClick() {
+        autoCollapseTask?.cancel()
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+            interaction.isHovered = false
+            interaction.pinnedOpen = false
+            interaction.isDetailVisible = false
+            interaction.isSettingsHovered = false
+            interaction.hoveredIndex = nil
+            interaction.collapseToken &+= 1
+        }
+    }
+
+}
+
+// MARK: - Notch & Detail Views
+
+struct NotchView: View {
+    @Bindable var store: UsageStore
+    @Bindable var interaction: NotchInteractionState
+    @AppStorage(AppSettings.themeColorKey) private var themeRaw = ThemeColor.red.rawValue
+
+    private var currentTheme: ThemeColor {
+        ThemeColor(rawValue: themeRaw) ?? .red
+    }
+
+    private var activeStatuses: [ProviderStatus] {
+        let detected = store.detectedStatuses
+        if !detected.isEmpty {
+            return detected
+        }
+        return store.statuses
+    }
+
+    private var activeIndex: Int? {
+        guard let idx = interaction.hoveredIndex, idx >= 0, idx < activeStatuses.count else {
+            return nil
+        }
+        return idx
+    }
+
+    private var activeStatus: ProviderStatus? {
+        guard let idx = activeIndex else { return nil }
+        return activeStatuses[idx]
+    }
+
+    private var shouldShowDetailCard: Bool {
+        interaction.isDetailVisible || interaction.pinnedOpen
+    }
+
+    private var isExpanded: Bool {
+        switch interaction.displayMode {
+        case .alwaysExpanded:
+            true
+        case .hover:
+            interaction.isHovered || interaction.pinnedOpen || activeIndex != nil || interaction.isSettingsHovered
+        case .hidden:
+            false
+        }
+    }
+
+    private var cardOffsetY: CGFloat {
+        guard let idx = activeIndex else { return 16 }
+        return CGFloat(idx) * 88 + 16
+    }
+
+    private var relativePointerY: CGFloat {
+        70
+    }
+
+    private var isLeft: Bool {
+        interaction.position == .leftCenter
+    }
+
+    private var isBottom: Bool {
+        interaction.position == .bottomCenter
+    }
+
+    var body: some View {
+        let _ = interaction.collapseToken
+        ZStack(alignment: .trailing) {
+            // Transparent background that catches clicks outside to dismiss immediately
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                        interaction.pinnedOpen = false
+                        interaction.hoveredIndex = nil
+                        interaction.isHovered = false
+                        interaction.isDetailVisible = false
+                        interaction.isSettingsHovered = false
+                    }
+                }
+
+            if interaction.position == .bottomCenter {
+                horizontalLayout
+            } else {
+                verticalLayout
+            }
+        }
+        .padding(.trailing, 0)
+        .opacity(interaction.displayMode == .hidden ? 0 : 1)
+        .allowsHitTesting(interaction.displayMode != .hidden)
+        .ignoresSafeArea()
+        .onChange(of: activeStatuses.count, initial: true) {
+            interaction.providerCount = activeStatuses.count
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+        .animation(
+            .spring(response: AppSettings.animationDuration, dampingFraction: 0.88, blendDuration: 0.12),
+            value: isExpanded
+        )
+    }
+
+    private var verticalLayout: some View {
+        HStack(alignment: .top, spacing: 10) {
+            if isLeft { morphingNotchRail } else { Spacer() }
+
+            if let status = activeStatus, (interaction.isHovered || interaction.pinnedOpen) {
+                DetailPopoverCard(status: status, pointerY: relativePointerY, pointerOnLeft: isLeft)
+                    .id("DetailPopoverCard")
+                    .offset(y: cardOffsetY)
+                    .animation(.spring(response: 0.18, dampingFraction: 0.88), value: cardOffsetY)
+                    .transition(
+                        .asymmetric(
+                            insertion: .scale(scale: 0.95, anchor: isLeft ? .leading : .trailing)
+                                .combined(with: .opacity)
+                                .combined(with: .offset(x: isLeft ? -12 : 12)),
+                            removal: .opacity
+                                .combined(with: .scale(scale: 0.96, anchor: isLeft ? .leading : .trailing))
+                        )
+                    )
+            }
+
+            if isLeft { Spacer() } else { morphingNotchRail }
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    private var horizontalLayoutMetrics: (cardOffsetX: CGFloat, pointerX: CGFloat) {
+        guard let idx = activeIndex else { return (0, 156) }
+        let count = activeStatuses.count
+        let targetItemCenterX = HorizontalBarLayout.itemCenterX(for: idx, totalCount: count)
+
+        let cardWidth: CGFloat = 312
+        let clampedCardOffsetX = min(max(targetItemCenterX, -140), 140)
+        let relativePointerX = (targetItemCenterX - clampedCardOffsetX) + (cardWidth / 2)
+        let clampedPointerX = min(max(relativePointerX, 28), cardWidth - 28)
+        return (clampedCardOffsetX, clampedPointerX)
+    }
+
+    private var horizontalLayout: some View {
+        let metrics = horizontalLayoutMetrics
+        return VStack(spacing: 8) {
+            Spacer(minLength: 0)
+
+            if let status = activeStatus, (interaction.isHovered || interaction.pinnedOpen) {
+                DetailPopoverCard(
+                    status: status,
+                    pointerY: relativePointerY,
+                    verticalPointerOnTop: false,
+                    pointerX: metrics.pointerX
+                )
+                .offset(x: metrics.cardOffsetX)
+                .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .bottom)))
+            }
+
+            bottomIslandBar
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Bottom Floating Island (.bottomCenter)
+
+    private var bottomIslandBar: some View {
+        let items = activeStatuses
+        let count = items.count
+        let width = isExpanded ? HorizontalBarLayout.expandedWidth(for: count) : HorizontalBarLayout.collapsedWidth
+        let height = isExpanded ? HorizontalBarLayout.barHeight : HorizontalBarLayout.collapsedHeight
+
+        let shape = BottomIslandCapsule(
+            flareWidth: isExpanded ? 20 : 0,
+            flareHeight: isExpanded ? 16 : 0,
+            cornerRadius: isExpanded ? 20 : 8
+        )
+
+        return ZStack {
+            if isExpanded {
+                HStack(spacing: HorizontalBarLayout.itemSpacing) {
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, status in
+                        ProviderRailItem(status: status, isHovered: interaction.hoveredIndex == index, animationsEnabled: isExpanded)
+                            .frame(width: HorizontalBarLayout.itemWidth, height: 58)
+                            .contentShape(Rectangle())
+                            .onHover { hovering in
+                                guard hovering else { return }
+                                interaction.hoveredIndex = index
+                                interaction.isDetailVisible = true
+                                interaction.isHovered = true
+                            }
+                            .onTapGesture {
+                                withAnimation(.spring(response: 0.18, dampingFraction: 0.88)) {
+                                    interaction.pinnedOpen.toggle()
+                                }
+                            }
+                    }
+
+                }
+                .padding(.horizontal, HorizontalBarLayout.sidePadding)
+                .padding(.top, 8)
+                .transition(
+                    .asymmetric(
+                        insertion: .opacity
+                            .combined(with: .scale(scale: 0.94, anchor: .bottom))
+                            .animation(.spring(response: AppSettings.animationDuration, dampingFraction: 0.86)),
+                        removal: .opacity
+                            .combined(with: .scale(scale: 0.94, anchor: .bottom))
+                            .animation(.spring(response: AppSettings.animationDuration, dampingFraction: 0.86))
+                    )
+                )
+            } else {
+                bottomIslandAmbientView
+                    .transition(.opacity)
+            }
+        }
+        .frame(width: width, height: height)
+        .background(
+            shape
+                .fill(Color.clear)
+                .background(ThemedGlass(shape: shape))
+                .overlay(
+                    currentTheme.color.opacity(0.14)
+                        .clipShape(shape)
+                )
+                .overlay(shape.stroke(Color.white.opacity(isExpanded ? 0.15 : 0.08), lineWidth: 0.75))
+                .shadow(
+                    color: Color.black.opacity(isExpanded ? 0.55 : 0.35),
+                    radius: isExpanded ? 18 : 5,
+                    y: -1
+                )
+        )
+        .overlay(alignment: .topTrailing) {
+            if isExpanded {
+                SettingsCornerButton(
+                    isHovered: interaction.isSettingsHovered,
+                    onInteract: { interaction.pinnedOpen = true }
+                )
+                .scaleEffect(0.9)
+                .offset(x: 50, y: 6)
+            }
+        }
+    }
+
+    private var bottomIslandAmbientView: some View {
+        HStack(spacing: 8) {
+            if hasNeedsAttention {
+                Circle()
+                    .fill(Color(red: 1.0, green: 0.70, blue: 0.12))
+                    .frame(width: 5, height: 5)
+                    .shadow(color: Color(red: 1.0, green: 0.70, blue: 0.12), radius: 3)
+                    .padding(.top, 4)
+            } else if hasWorking {
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: 4, height: 4)
+                    .padding(.top, 4)
+            }
+        }
+        .frame(height: 20)
+    }
+
+    // MARK: - Morphing Notch Rail
+
+    private var hasNeedsAttention: Bool {
+        activeStatuses.contains { $0.activity.needsAttention }
+    }
+
+    private var hasWorking: Bool {
+        activeStatuses.contains { $0.activity.isWorking }
+    }
+
+    private var morphingNotchRail: some View {
+        let items = activeStatuses
+
+        return ZStack(alignment: .topTrailing) {
+            VStack(spacing: 12) {
+                // When collapsed the rail is invisible (opacity 0): do not mount
+                // the items at all so their infinite CA/SwiftUI animations stop
+                // instead of rendering 24/7 behind an opacity-0 container.
+                if isExpanded {
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, status in
+                        ProviderRailItem(
+                            status: status,
+                            isHovered: interaction.hoveredIndex == index,
+                            animationsEnabled: isExpanded
+                        )
+                        .frame(width: 72, height: 76)
+                        .contentShape(Rectangle())
+                        .onHover { hovering in
+                            guard hovering else { return }
+                            interaction.hoveredIndex = index
+                            interaction.isDetailVisible = true
+                            interaction.isHovered = true
+                        }
+                        .onTapGesture {
+                            withAnimation(.spring(response: 0.18, dampingFraction: 0.88)) {
+                                interaction.pinnedOpen.toggle()
+                            }
+                        }
+                    }
+
+                    if items.isEmpty {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundStyle(.white)
+                            .frame(height: 50)
+                    }
+                }
+            }
+            .opacity(isExpanded ? 1.0 : 0.0)
+            .scaleEffect(isExpanded ? 1.0 : 0.85, anchor: .topTrailing)
+            .animation(
+                .spring(response: AppSettings.animationDuration, dampingFraction: 0.86),
+                value: isExpanded
+            )
+            .padding(.top, 48)
+            .padding(.bottom, 48)
+            .frame(width: 72)
+        }
+        .frame(width: isExpanded ? 72 : 20, height: isExpanded ? nil : 64, alignment: isLeft ? .topLeading : .topTrailing)
+        .background(
+            OrientedRailShape(
+                flareWidth: isExpanded ? 24 : 0,
+                flareHeight: isExpanded ? 36 : 0,
+                cornerRadius: isExpanded ? 28 : 8,
+                mirrored: isLeft
+            )
+            .fill(Color.clear)
+            .background(
+                ThemedGlass(
+                    shape: OrientedRailShape(
+                        flareWidth: isExpanded ? 24 : 0,
+                        flareHeight: isExpanded ? 36 : 0,
+                        cornerRadius: isExpanded ? 28 : 8,
+                        mirrored: isLeft
+                    )
+                )
+            )
+            .overlay(
+                currentTheme.color.opacity(0.14)
+                    .clipShape(
+                        OrientedRailShape(
+                            flareWidth: isExpanded ? 24 : 0,
+                            flareHeight: isExpanded ? 36 : 0,
+                            cornerRadius: isExpanded ? 28 : 8,
+                            mirrored: isLeft
+                        )
+                    )
+            )
+            .shadow(color: Color.black.opacity(isExpanded ? 0.5 : 0.35), radius: isExpanded ? 14 : 5, x: isExpanded ? -4 : -1, y: 0)
+        )
+        .overlay(alignment: isLeft ? .topLeading : .topTrailing) {
+            if !isExpanded {
+                if hasNeedsAttention {
+                    // Ambient Amber Beacon on Collapsed Notch Bezel
+                    Circle()
+                        .fill(Color(red: 1.0, green: 0.70, blue: 0.12))
+                        .frame(width: 5, height: 5)
+                        .shadow(color: Color(red: 1.0, green: 0.70, blue: 0.12), radius: 3)
+                        .padding(.trailing, isLeft ? 0 : 6)
+                        .padding(.leading, isLeft ? 6 : 0)
+                        .padding(.top, 8)
+                } else if hasWorking {
+                    // Ambient Pure White Solid Dot on Collapsed Notch Bezel
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 4, height: 4)
+                        .padding(.trailing, isLeft ? 0 : 6)
+                        .padding(.leading, isLeft ? 6 : 0)
+                        .padding(.top, 8)
+                }
+            }
+        }
+        .overlay(alignment: isLeft ? .bottomTrailing : .bottomLeading) {
+            if isExpanded {
+                SettingsCornerButton(
+                    isHovered: interaction.isSettingsHovered,
+                    onInteract: { interaction.pinnedOpen = true }
+                )
+                .offset(x: isLeft ? -1 : 1, y: 30)
+            }
+        }
+    }
+}
+
+// MARK: - Bottom Corner Settings Trigger
+
+/// Solid pitch-black circular button with a crisp white outline gear, flush with the notch rail
+/// and nestled comfortably below the curve as shown in the reference image.
+struct SettingsCornerButton: View {
+    let isHovered: Bool
+    let onInteract: () -> Void
+    @AppStorage(AppSettings.themeColorKey) private var themeRaw = ThemeColor.red.rawValue
+
+    private var currentTheme: ThemeColor {
+        ThemeColor(rawValue: themeRaw) ?? .red
+    }
+
+    var body: some View {
+        ZStack {
+            ZStack {
+                // Solid pitch-black circular background
+                ThemedGlass(shape: Circle())
+                    .frame(width: 52, height: 52)
+                    .overlay(
+                        Circle()
+                            .fill(currentTheme.color.opacity(0.14))
+                    )
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(isHovered ? 0.35 : 0.18), lineWidth: 1)
+                    )
+                    .shadow(color: Color.black.opacity(0.65), radius: 6, x: -1, y: 2)
+
+                // Clean white outline gear icon matching reference
+                Image(systemName: "gearshape")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(.white)
+                    .rotationEffect(.degrees(isHovered ? 0 : -45))
+            }
+            .scaleEffect(isHovered ? 1.0 : 0.6)
+            .opacity(isHovered ? 1.0 : 0.0)
+            .animation(.spring(response: 0.22, dampingFraction: 0.8), value: isHovered)
+        }
+        .frame(width: 72, height: 72)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onInteract()
+            openSettings()
+        }
+    }
+
+
+    private func openSettings() {
+        NotificationCenter.default.post(name: .openNotchlySettings, object: nil)
+    }
+}
+
+/// Sleek inline circular settings gear button that is seamlessly integrated into horizontal Dynamic Notch / Island bars.
+struct SettingsInlineButton: View {
+    let isHovered: Bool
+    let onInteract: () -> Void
+
+    var body: some View {
+        Button {
+            onInteract()
+            NotificationCenter.default.post(name: .openNotchlySettings, object: nil)
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(Color.white.opacity(isHovered ? 0.20 : 0.08))
+                    .frame(width: 36, height: 36)
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(isHovered ? 0.40 : 0.16), lineWidth: 0.8)
+                    )
+
+                Image(systemName: "gearshape")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(.white.opacity(isHovered ? 1.0 : 0.75))
+                    .rotationEffect(.degrees(isHovered ? 45 : 0))
+            }
+            .scaleEffect(isHovered ? 1.06 : 1.0)
+            .animation(.spring(response: 0.22, dampingFraction: 0.8), value: isHovered)
+        }
+        .buttonStyle(.plain)
+        .frame(width: 44, height: 44)
+        .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Live Agent Activity Motion Indicators
+
+/// High-precision Swiss chronograph aperture perimeter tracer that glides along
+/// the exact outer path of any selected shape (Circle, Squircle, Rounded, Square)
+/// without rotating the shape geometry across the center.
+struct PrecisionChronographAperture: NSViewRepresentable {
+    var shape: ProviderIconShape = .circle
+    @AppStorage(AppSettings.activityAnimationDurationKey) private var duration = 1.6
+
+    func makeNSView(context: Context) -> PerimeterAnimationView {
+        PerimeterAnimationView()
+    }
+
+    func updateNSView(_ view: PerimeterAnimationView, context: Context) {
+        view.configure(shape: shape, duration: duration)
+    }
+
+    static func dismantleNSView(_ view: PerimeterAnimationView, coordinator: ()) {
+        view.stop()
+    }
+}
+
+/// Core Animation interpolates the same trimmed outline without SwiftUI updates
+/// on every frame. The second beam carries the segment across the path's seam.
+final class PerimeterAnimationView: NSView {
+    private let bezel = CAShapeLayer()
+    private let beam = CAShapeLayer()
+    private let wrappedBeam = CAShapeLayer()
+    private var shape: ProviderIconShape = .circle
+    private var duration: Double = 1.6
+    private var renderedBounds: CGRect?
+
+    override var isFlipped: Bool { true }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        for outline in [bezel, beam, wrappedBeam] {
+            outline.fillColor = nil
+            outline.strokeColor = NSColor.white.cgColor
+            outline.lineWidth = 3.4
+            outline.lineCap = .round
+            layer?.addSublayer(outline)
+        }
+        bezel.strokeColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        bezel.lineWidth = 1.2
+        beam.strokeEnd = 0.28
+        wrappedBeam.strokeEnd = 0
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(shape: ProviderIconShape, duration: Double) {
+        let safeDuration = duration.isFinite && duration > 0 ? duration : 1.6
+        if self.shape != shape {
+            self.shape = shape
+            renderedBounds = nil
+            needsLayout = true
+        }
+        if self.duration != safeDuration {
+            self.duration = safeDuration
+            stop()
+        }
+        startIfNeeded()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { stop() } else { startIfNeeded() }
+    }
+
+    override func layout() {
+        super.layout()
+        guard renderedBounds != bounds else { return }
+        renderedBounds = bounds
+        let path: Path
+        switch shape {
+        case .circle: path = Circle().path(in: bounds)
+        case .squircle: path = RoundedRectangle(cornerRadius: 12, style: .continuous).path(in: bounds)
+        case .rounded: path = RoundedRectangle(cornerRadius: 7, style: .continuous).path(in: bounds)
+        case .square: path = RoundedRectangle(cornerRadius: 3, style: .continuous).path(in: bounds)
+        }
+        let rotation = CGAffineTransform(translationX: bounds.midX, y: bounds.midY)
+            .rotated(by: -.pi / 2)
+            .translatedBy(x: -bounds.midX, y: -bounds.midY)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        bezel.path = path.cgPath
+        beam.path = path.applying(rotation).cgPath
+        wrappedBeam.path = beam.path
+        CATransaction.commit()
+    }
+
+    func stop() {
+        beam.removeAllAnimations()
+        wrappedBeam.removeAllAnimations()
+    }
+
+    private func startIfNeeded() {
+        guard window != nil, beam.animation(forKey: "travel") == nil else { return }
+        let start = CAKeyframeAnimation(keyPath: "strokeStart")
+        start.values = [0, 1]
+        start.keyTimes = [0, 1]
+        let end = CAKeyframeAnimation(keyPath: "strokeEnd")
+        end.values = [0.28, 1, 1]
+        end.keyTimes = [0, 0.72, 1]
+        let wrap = CAKeyframeAnimation(keyPath: "strokeEnd")
+        wrap.values = [0, 0, 0.28]
+        wrap.keyTimes = [0, 0.72, 1]
+        let begin = CACurrentMediaTime()
+        for (target, animations) in [(beam, [start, end]), (wrappedBeam, [wrap])] {
+            for animation in animations { animation.duration = duration }
+            let group = CAAnimationGroup()
+            group.animations = animations
+            group.duration = duration
+            group.repeatCount = .infinity
+            group.beginTime = begin
+            target.add(group, forKey: "travel")
+        }
+    }
+}
+
+/// Radiant warm amber sonar beacon indicating that user input or approval is required.
+struct AgentNeedsAttentionBeacon: View {
+    var shape: ProviderIconShape = .circle
+    @State private var pulse: Bool = false
+    private let accentColor = Color(red: 1.0, green: 0.70, blue: 0.12)
+
+    var body: some View {
+        ZStack {
+            // Layer 1: Sonar Radar Ping expanding outward
+            strokeBeacon(accentColor.opacity(pulse ? 0.0 : 0.7), lineWidth: 1.5)
+                .scaleEffect(pulse ? 1.32 : 1.0)
+
+            // Layer 2: Warm ambient inner rim glow
+            strokeBeacon(accentColor.opacity(pulse ? 0.45 : 0.2), lineWidth: 2)
+
+            // Layer 3: Jewel Badge at top-right
+            ZStack {
+                // Obsidian shadow base
+                Circle()
+                    .fill(Color(red: 0.08, green: 0.08, blue: 0.10))
+                    .frame(width: 14, height: 14)
+                    .shadow(color: Color.black.opacity(0.6), radius: 3, x: 0, y: 1)
+
+                // Glowing amber core with gentle heartbeat
+                Circle()
+                    .fill(accentColor)
+                    .frame(width: 8, height: 8)
+                    .scaleEffect(pulse ? 1.15 : 0.95)
+
+                // High-clarity spark
+                Circle()
+                    .fill(Color.white.opacity(0.95))
+                    .frame(width: 2.5, height: 2.5)
+            }
+            .offset(x: 15, y: -15)
+        }
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) {
+                pulse = true
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func strokeBeacon(_ color: Color, lineWidth: CGFloat) -> some View {
+        switch shape {
+        case .circle:
+            Circle().stroke(color, lineWidth: lineWidth)
+        case .squircle:
+            RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(color, lineWidth: lineWidth)
+        case .rounded:
+            RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(color, lineWidth: lineWidth)
+        case .square:
+            RoundedRectangle(cornerRadius: 3, style: .continuous).stroke(color, lineWidth: lineWidth)
+        }
+    }
+}
+
+// MARK: - Provider Rail Item (Ring + Percentage)
+
+struct ProviderRailItem: View {
+    let status: ProviderStatus
+    let isHovered: Bool
+    var animationsEnabled = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage(AppSettings.providerIconShapeKey) private var iconShapeRaw = ProviderIconShape.circle.rawValue
+
+    private var currentShape: ProviderIconShape {
+        ProviderIconShape(rawValue: iconShapeRaw) ?? .circle
+    }
+
+    private var remainingPercent: Double {
+        status.primary?.remainingPercent ?? 0
+    }
+
+    private var displayedPercent: Double {
+        switch AppSettings.usageDisplayMode {
+        case .remaining: remainingPercent
+        case .used: 100 - remainingPercent
+        }
+    }
+
+    private var percentageLabel: String {
+        guard status.primary != nil else { return "—" }
+        return "\(Int(displayedPercent.rounded()))%"
+    }
+
+    private var gaugeColor: Color {
+        status.primary?.tierColor ?? Color(red: 0.18, green: 0.85, blue: 0.45)
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            // Gauge / Active Activity Frame
+            ZStack {
+                // Background Track
+                trackView
+
+                // When STOPPED/IDLE: Display standard quota gauge
+                if !status.activity.isWorking {
+                    gaugeFillView
+                }
+
+                // When RUNNING: Precision Chronograph Aperture
+                if status.activity.isWorking {
+                    if reduceMotion || !animationsEnabled {
+                        chronographFallbackView
+                    } else {
+                        PrecisionChronographAperture(shape: currentShape)
+                    }
+                } else if status.activity.needsAttention {
+                    if reduceMotion || !animationsEnabled {
+                        Circle()
+                            .fill(Color(red: 1.0, green: 0.70, blue: 0.12))
+                            .frame(width: 8, height: 8)
+                            .offset(x: 15, y: -15)
+                    } else {
+                        AgentNeedsAttentionBeacon(shape: currentShape)
+                    }
+                }
+
+                // Provider Logo Center
+                ProviderLogo(provider: status.provider, size: 18)
+                    .foregroundStyle(.white)
+                    .scaleEffect(status.activity.isWorking ? 1.04 : 1.0)
+            }
+            .frame(width: 42, height: 42)
+            .scaleEffect(isHovered ? 1.06 : 1.0)
+            .animation(.spring(response: 0.28, dampingFraction: 0.8), value: isHovered)
+
+            // Percentage Text
+            Text(percentageLabel)
+                .font(.custom("Spline Sans Mono", size: 13).weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(width: 52, height: 18, alignment: .center)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private var trackView: some View {
+        switch currentShape {
+        case .circle:
+            Circle().stroke(Color.white.opacity(0.14), lineWidth: 5.2)
+        case .squircle:
+            RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 5.2)
+        case .rounded:
+            RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 5.2)
+        case .square:
+            RoundedRectangle(cornerRadius: 3, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 5.2)
+        }
+    }
+
+    @ViewBuilder
+    private var gaugeFillView: some View {
+        let trimEnd = max(0.02, CGFloat(remainingPercent / 100))
+        let strokeStyle = StrokeStyle(lineWidth: 5.2, lineCap: .round)
+        switch currentShape {
+        case .circle:
+            Circle()
+                .trim(from: 0, to: trimEnd)
+                .stroke(gaugeColor, style: strokeStyle)
+                .rotationEffect(.degrees(-90))
+        case .squircle:
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .trim(from: 0, to: trimEnd)
+                .stroke(gaugeColor, style: strokeStyle)
+                .rotationEffect(.degrees(-90))
+        case .rounded:
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .trim(from: 0, to: trimEnd)
+                .stroke(gaugeColor, style: strokeStyle)
+                .rotationEffect(.degrees(-90))
+        case .square:
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                .trim(from: 0, to: trimEnd)
+                .stroke(gaugeColor, style: strokeStyle)
+                .rotationEffect(.degrees(-90))
+        }
+    }
+
+    @ViewBuilder
+    private var chronographFallbackView: some View {
+        let strokeStyle = StrokeStyle(lineWidth: 3.2, lineCap: .round)
+        switch currentShape {
+        case .circle:
+            Circle().stroke(Color.white.opacity(0.85), style: strokeStyle).rotationEffect(.degrees(-90))
+        case .squircle:
+            RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.85), style: strokeStyle).rotationEffect(.degrees(-90))
+        case .rounded:
+            RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.white.opacity(0.85), style: strokeStyle).rotationEffect(.degrees(-90))
+        case .square:
+            RoundedRectangle(cornerRadius: 3, style: .continuous).stroke(Color.white.opacity(0.85), style: strokeStyle).rotationEffect(.degrees(-90))
+        }
+    }
+}
+
+// MARK: - Detail Popover Card
+
+struct DetailPopoverCard: View {
+    let status: ProviderStatus
+    let pointerY: CGFloat
+    let pointerOnLeft: Bool
+    let verticalPointerOnTop: Bool?
+    let pointerX: CGFloat?
+    @AppStorage(AppSettings.themeColorKey) private var themeRaw = ThemeColor.red.rawValue
+
+    private var currentTheme: ThemeColor {
+        ThemeColor(rawValue: themeRaw) ?? .red
+    }
+
+    init(
+        status: ProviderStatus,
+        pointerY: CGFloat,
+        pointerOnLeft: Bool = false,
+        verticalPointerOnTop: Bool? = nil,
+        pointerX: CGFloat? = nil
+    ) {
+        self.status = status
+        self.pointerY = pointerY
+        self.pointerOnLeft = pointerOnLeft
+        self.verticalPointerOnTop = verticalPointerOnTop
+        self.pointerX = pointerX
+    }
+
+    private var primaryWindow: UsageWindow? {
+        status.primary
+    }
+
+    private var secondaryWindow: UsageWindow? {
+        status.secondary
+    }
+
+    private var gaugeColor: Color {
+        primaryWindow?.tierColor ?? Color(red: 0.18, green: 0.85, blue: 0.45)
+    }
+
+    private func displayedPercent(for window: UsageWindow?) -> Double {
+        let remaining = window?.remainingPercent ?? 0
+        switch AppSettings.usageDisplayMode {
+        case .remaining: return remaining
+        case .used: return 100 - remaining
+        }
+    }
+
+    private var usageLabel: String {
+        AppSettings.usageDisplayMode == .remaining ? "Remaining" : "Used"
+    }
+
+    private var cardWidth: CGFloat {
+        312
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // Header: Logo + Provider Name + Live Activity Chip / Resets Countdown
+            HStack(spacing: 8) {
+                ProviderLogo(provider: status.provider, size: 19)
+                    .foregroundStyle(.white)
+
+                Text("\(status.provider.name) Usage")
+                    .font(.system(size: 15, weight: .semibold, design: .default))
+                    .foregroundStyle(.white)
+
+                Spacer()
+
+                if status.activity.isWorking {
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(Color.white)
+                            .frame(width: 5, height: 5)
+
+                        Text("Running")
+                            .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                    }
+                    .padding(.horizontal, 7.5)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule()
+                            .fill(Color.white.opacity(0.12))
+                            .overlay(
+                                Capsule().stroke(Color.white.opacity(0.22), lineWidth: 0.75)
+                            )
+                    )
+                } else if status.activity.needsAttention {
+                    HStack(spacing: 4.5) {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundStyle(Color(red: 1.0, green: 0.72, blue: 0.12))
+                        Text("Action Required")
+                            .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                            .foregroundStyle(Color(red: 1.0, green: 0.72, blue: 0.12))
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule()
+                            .fill(Color(red: 1.0, green: 0.72, blue: 0.12).opacity(0.14))
+                            .overlay(Capsule().stroke(Color(red: 1.0, green: 0.72, blue: 0.12).opacity(0.38), lineWidth: 0.75))
+                    )
+                } else if let countdown = primaryWindow?.resetsInCountdown {
+                    Text(countdown)
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(Color.white.opacity(0.48))
+                }
+            }
+
+            // Multi-account subscriptions get one row per signed-in account;
+            // single-account providers keep the classic primary/secondary pair.
+            if let accounts = status.accounts, accounts.count > 1 {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(accounts.enumerated()), id: \.offset) { _, account in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(account.label)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(Color.white.opacity(0.85))
+                                Spacer()
+                                if let resetText = account.primary?.formattedAbsoluteReset {
+                                    Text(resetText)
+                                        .font(.system(size: 10.5))
+                                        .foregroundStyle(Color.white.opacity(0.45))
+                                }
+                            }
+                            CustomProgressBar(
+                                value: displayedPercent(for: account.primary),
+                                gradient: account.primary?.gradient ?? defaultGradient
+                            )
+                            Text("\(Int(displayedPercent(for: account.primary).rounded()))% \(usageLabel)")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Color.white.opacity(0.6))
+                        }
+                    }
+                }
+            } else {
+                // Primary Window: "Current session"
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Current session")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.85))
+
+                    // Horizontal Progress Bar
+                    CustomProgressBar(
+                        value: displayedPercent(for: primaryWindow),
+                        gradient: primaryWindow?.gradient ?? defaultGradient
+                    )
+
+                    // Sub-labels: "73% Remaining" and "Resets Thu 12:00 AM"
+                    HStack {
+                        Text("\(Int(displayedPercent(for: primaryWindow).rounded()))% \(usageLabel)")
+                            .font(.system(size: 11.5, weight: .regular))
+                            .foregroundStyle(Color.white.opacity(0.6))
+
+                        Spacer()
+
+                        if let resetText = primaryWindow?.formattedAbsoluteReset {
+                            Text(resetText)
+                                .font(.system(size: 11.5, weight: .regular))
+                                .foregroundStyle(Color.white.opacity(0.48))
+                        }
+                    }
+                }
+
+                // Secondary Window: "All models" / "Weekly"
+                if let secondary = secondaryWindow {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(status.provider == .claude ? "All models" : "Weekly")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(Color.white.opacity(0.85))
+
+                        CustomProgressBar(
+                            value: displayedPercent(for: secondary),
+                            gradient: secondary.gradient
+                        )
+
+                        HStack {
+                            Text("\(Int(displayedPercent(for: secondary).rounded()))% \(usageLabel)")
+                                .font(.system(size: 11.5, weight: .regular))
+                                .foregroundStyle(Color.white.opacity(0.6))
+
+                            Spacer()
+
+                            if let resetText = secondary.formattedAbsoluteReset {
+                                Text(resetText)
+                                    .font(.system(size: 11.5, weight: .regular))
+                                    .foregroundStyle(Color.white.opacity(0.48))
+                            }
+                        }
+                    }
+                }
+            }
+
+            costUsageSection
+
+            if let error = status.error {
+                Text(error)
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(Color.red.opacity(0.85))
+                    .lineLimit(2)
+            }
+        }
+        .padding(.vertical, verticalPointerOnTop == nil ? 14 : 20)
+        .padding(.leading, pointerOnLeft ? 24 : 16)
+        .padding(.trailing, pointerOnLeft ? 16 : 24)
+        .frame(width: cardWidth)
+        .background { cardBackground }
+    }
+
+    @ViewBuilder
+    private var cardBackground: some View {
+        if let verticalPointerOnTop {
+            let shape = VerticalPopoverCalloutShape(
+                pointerX: pointerX ?? (cardWidth / 2),
+                pointerOnTop: verticalPointerOnTop
+            )
+            ThemedGlass(shape: shape)
+                .overlay(currentTheme.color.opacity(0.14).clipShape(shape))
+                .overlay(shape.stroke(Color.white.opacity(0.12), lineWidth: 1))
+                .shadow(color: Color.black.opacity(0.65), radius: 24, y: verticalPointerOnTop ? 10 : -10)
+        } else {
+            let shape = PopoverCalloutShape(pointerY: pointerY, pointerOnLeft: pointerOnLeft)
+            ThemedGlass(shape: shape)
+                .overlay(currentTheme.color.opacity(0.14).clipShape(shape))
+                .overlay(shape.stroke(Color.white.opacity(0.12), lineWidth: 1))
+                .shadow(color: Color.black.opacity(0.65), radius: 24, x: pointerOnLeft ? 8 : -8, y: 10)
+        }
+    }
+
+    @ViewBuilder
+    private var costUsageSection: some View {
+        if let cost = status.costUsage, cost.historyAvailable {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Token usage")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.85))
+                HStack {
+                    Text("Today")
+                    Spacer()
+                    Text(Self.tokenAndCost(tokens: cost.todayTokens, cost: cost.todayCostUSD))
+                }
+                HStack {
+                    Text("Last 30 days")
+                    Spacer()
+                    Text(Self.tokenAndCost(tokens: cost.last30DaysTokens, cost: cost.last30DaysCostUSD))
+                }
+                .foregroundStyle(Color.white.opacity(0.6))
+                .font(.system(size: 11.5, weight: .regular))
+            }
+        } else {
+            EmptyView()
+        }
+    }
+
+    private static func tokenAndCost(tokens: Int?, cost: Double?) -> String {
+        guard let tokens else { return "—" }
+        let tokenText = Self.compactTokenCount(tokens)
+        guard let cost else { return tokenText }
+        return "\(tokenText) · \(String(format: "$%.2f", cost))"
+    }
+
+    private static func compactTokenCount(_ tokens: Int) -> String {
+        let value = Double(abs(tokens))
+        let suffix: String
+        let scaled: Double
+        switch value {
+        case 1_000_000_000...:
+            scaled = value / 1_000_000_000
+            suffix = "b"
+        case 1_000_000...:
+            scaled = value / 1_000_000
+            suffix = "m"
+        case 1_000...:
+            scaled = value / 1_000
+            suffix = "k"
+        default:
+            return tokens.formatted()
+        }
+        let precision = scaled >= 100 ? "%.0f" : scaled >= 10 ? "%.1f" : "%.2f"
+        let sign = tokens < 0 ? "-" : ""
+        return "\(sign)\(String(format: precision, scaled))\(suffix)"
+    }
+
+    private var defaultGradient: LinearGradient {
+        LinearGradient(
+            colors: [Color(red: 0.22, green: 0.88, blue: 0.52), Color(red: 0.14, green: 0.78, blue: 0.38)],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+}
+
+// MARK: - Custom Progress Bar
+
+struct CustomProgressBar: View {
+    let value: Double
+    let gradient: LinearGradient
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            let fillWidth = max(4, width * CGFloat(min(100, max(0, value)) / 100))
+
+            ZStack(alignment: .leading) {
+                // Background Track
+                Capsule()
+                    .fill(Color.white.opacity(0.14))
+                    .frame(height: 5.5)
+
+                // Colored Fill
+                Capsule()
+                    .fill(gradient)
+                    .frame(width: fillWidth, height: 5.5)
+            }
+        }
+        .frame(height: 5.5)
     }
 }

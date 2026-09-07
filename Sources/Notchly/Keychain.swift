@@ -2,45 +2,42 @@ import Foundation
 import Security
 
 enum Keychain {
-    static let service = "Notchly"
-
-    static func set(_ value: String, account: String) {
-        let data = Data(value.utf8)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+    static func get(account: String, service: String = "Notchly") -> String? {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecReturnData: true,
+            kSecMatchLimit: kSecMatchLimitOne,
         ]
-        let attrs: [String: Any] = [kSecValueData as String: data]
-        let status = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
-        if status == errSecItemNotFound {
-            var add = query
-            add[kSecValueData as String] = data
-            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-            SecItemAdd(add as CFDictionary, nil)
-        }
-    }
-
-    static func get(account: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else { return nil }
-        guard let data = item as? Data else { return nil }
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data
+        else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
-    static func delete(account: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+    @discardableResult
+    static func set(_ secret: String, account: String, service: String = "Notchly") -> Bool {
+        delete(account: account, service: service)
+        let attributes: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecValueData: Data(secret.utf8),
+            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlock,
         ]
-        SecItemDelete(query as CFDictionary)
+        return SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
+    }
+
+    @discardableResult
+    static func delete(account: String, service: String = "Notchly") -> Bool {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }
